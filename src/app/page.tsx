@@ -8,7 +8,12 @@ import {
 } from "lucide-react";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
+  LineChart, Line, CartesianGrid
 } from "recharts";
+import { predictAllergySeverity, PredictionResult } from "@/utils/prediction";
+
+import { io } from "socket.io-client";
+import SensorCard from "@/components/SensorCard";
 
 // react-globe.gl requires CSR only
 const Globe = dynamic(() => import("react-globe.gl"), { ssr: false });
@@ -48,14 +53,23 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [locationName, setLocationName] = useState<string | null>(null);
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
+  const [sensorData, setSensorData] = useState<{
+    bpm: number;
+    hum: number;
+    temp: number;
+    lat: number;
+    lng: number;
+    sats: number;
+  } | null>(null);
+  const [bpmHistory, setBpmHistory] = useState<{ time: string; bpm: number }[]>([]);
+  const [humidityHistory, setHumidityHistory] = useState<{ time: string; hum: number }[]>([]);
+  const [prediction, setPrediction] = useState<PredictionResult | null>(null);
 
   useEffect(() => {
-    // Handling window dimensions securely during CSR
     setDimensions({ width: window.innerWidth, height: window.innerHeight });
     const handleResize = () => setDimensions({ width: window.innerWidth, height: window.innerHeight });
     window.addEventListener("resize", handleResize);
     
-    // Enable auto-rotation
     if (globeRef.current) {
       globeRef.current.controls().autoRotate = true;
       globeRef.current.controls().autoRotateSpeed = 0.4;
@@ -63,19 +77,51 @@ export default function Home() {
     return () => window.removeEventListener("resize", handleResize);
   }, []);
 
+  useEffect(() => {
+    const socket = io("http://localhost:3001");
+
+    socket.on("connect", () => {
+      console.log("Connected to AARP Sensor Bridge");
+    });
+
+    socket.on("sensor-data", (newData: any) => {
+      setSensorData(newData);
+      
+      const risk = predictAllergySeverity({
+        humidity: newData.hum,
+        temperature: newData.temp,
+        bpm: newData.bpm,
+        aqi: data?.aqi || 50,
+        pm25: data?.aqiDetails?.pm25 || 15
+      });
+      setPrediction(risk);
+
+      const timeStamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      setBpmHistory(prev => [...prev, { time: timeStamp, bpm: newData.bpm }].slice(-30));
+      setHumidityHistory(prev => [...prev, { time: timeStamp, hum: newData.hum }].slice(-30));
+    });
+
+    return () => {
+      socket.disconnect();
+    };
+  }, [data]);
+
+  useEffect(() => {
+    if (sensorData?.lat && sensorData?.lng && !data && !loading) {
+      fetchDataForCoordinates(sensorData.lat, sensorData.lng, "Local Sensor Node");
+    }
+  }, [sensorData?.lat, sensorData?.lng]);
+
   const fetchDataForCoordinates = async (lat: number, lon: number, name?: string) => {
     setLoading(true);
     setError(null);
-    setData(null);
     
     if (globeRef.current) {
-      globeRef.current.controls().autoRotate = false;
       globeRef.current.pointOfView({ lat, lng: lon, altitude: 2 }, 1500);
     }
 
     try {
       if (!name) {
-        // Refined Geolocation lookup prioritizing local districts and suburbs over broad city zones
         const geoRes = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json`);
         const geoData = await geoRes.json();
         const address = geoData.address || {};
@@ -114,7 +160,6 @@ export default function Home() {
 
   return (
     <main className="relative h-screen w-screen overflow-hidden bg-black text-white font-sans">
-      {/* 3D Globe Background */}
       <div className="absolute inset-0 z-0">
         <Globe
           ref={globeRef}
@@ -135,21 +180,93 @@ export default function Home() {
         />
       </div>
 
-      {/* Hero Header */}
       <div className="absolute top-6 left-6 z-10 pointer-events-none">
-        <h1 className="text-3xl font-bold tracking-widest uppercase bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-emerald-400 drop-shadow-lg">AARP</h1>
+        <h1 className="text-3xl font-bold tracking-widest uppercase bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-emerald-400 drop-shadow-lg">AARP V2</h1>
         <p className="text-slate-400 text-xs tracking-widest mt-1 opacity-80 uppercase">Airborne Allergy & AQI Radar</p>
       </div>
 
-      {/* Floating Prompt UI (when no location is active) */}
-      {!data && !loading && (
+      {/* LEFT SIDEBAR: Live Sensors & ML */}
+      <div className="absolute top-24 left-6 z-10 flex flex-col gap-4 w-72 h-[calc(100vh-120px)] overflow-y-auto pr-2 no-scrollbar">
+        <AnimatePresence>
+          {sensorData && (
+            <motion.div 
+              initial={{ opacity: 0, x: -20 }} 
+              animate={{ opacity: 1, x: 0 }}
+              className="flex flex-col gap-4"
+            >
+              <SensorCard
+                title="Heart Rate"
+                value={sensorData.bpm}
+                unit="BPM"
+                icon={Activity}
+                color="rose"
+                trend={sensorData.bpm > 100 ? "High" : "Optimal"}
+              />
+              <SensorCard
+                title="Humidity"
+                value={sensorData.hum.toFixed(1)}
+                unit="%"
+                icon={Droplets}
+                color="blue"
+              />
+              
+              {/* ML SEVERITY PREDICTION */}
+              <motion.div
+                className={`p-6 rounded-3xl border ${prediction?.riskLevel === 'Extreme' ? 'border-red-500/40 bg-red-500/10' : 'border-blue-500/40 bg-blue-500/10'} backdrop-blur-xl relative overflow-hidden`}
+              >
+                <div className="absolute top-0 right-0 p-3 opacity-20"><Leaf className="w-12 h-12" /></div>
+                <h4 className="text-[10px] font-mono tracking-widest text-slate-400 uppercase mb-4">ML SEVERITY PREDICTION</h4>
+                <div className="flex items-baseline gap-2 mb-2">
+                  <span className="text-5xl font-black">{prediction?.severityIndex || 0}</span>
+                  <span className="text-xl font-bold opacity-50">SI</span>
+                </div>
+                <div className={`text-lg font-bold ${prediction?.riskLevel === 'Extreme' ? 'text-red-400' : 'text-blue-400'}`}>
+                  {prediction?.riskLevel} RISK
+                </div>
+                <p className="text-xs text-slate-400 mt-2 leading-relaxed">{prediction?.recommendation}</p>
+              </motion.div>
+
+              {/* REAL-TIME BPM GRAPH */}
+              <div className="p-4 rounded-2xl bg-white/5 border border-white/5 h-40">
+                <p className="text-[10px] font-mono text-white/30 uppercase mb-2">Pulse Waveform</p>
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={bpmHistory}>
+                    <defs>
+                      <linearGradient id="colorPulse" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#f43f5e" stopOpacity={0.8}/>
+                        <stop offset="95%" stopColor="#f43f5e" stopOpacity={0}/>
+                      </linearGradient>
+                    </defs>
+                    <Area type="monotone" dataKey="bpm" stroke="#f43f5e" fillOpacity={1} fill="url(#colorPulse)" animationDuration={300} isAnimationActive={false} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+
+              {/* GPS HUD */}
+              <div className="p-4 rounded-xl bg-black/40 backdrop-blur-md border border-white/5 flex flex-col gap-2">
+                <div className="flex justify-between items-center text-[10px] font-mono text-white/40 uppercase tracking-widest">
+                  <span>Hardware GPS</span>
+                  <span className="text-emerald-400">{sensorData.sats} SATS</span>
+                </div>
+                <div className="text-xs font-mono text-white/70">
+                  LAT: {sensorData.lat.toFixed(4)}<br/>
+                  LNG: {sensorData.lng.toFixed(4)}
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      {/* Floating Prompt */}
+      {!data && !loading && !sensorData && (
         <motion.div 
           initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }}
           className="absolute bottom-12 left-1/2 -translate-x-1/2 z-10 flex flex-col items-center gap-4 bg-black/60 backdrop-blur-xl border border-white/10 px-8 py-6 rounded-3xl"
         >
           <div className="flex items-center gap-3 text-sm text-slate-300">
             <AlertCircle className="w-5 h-5 text-blue-400 animate-pulse" />
-            Select any glowing point on the globe
+            Connect Hardware or Select Globe Point
           </div>
           <p className="text-xs text-slate-500 font-mono">OR</p>
           <button
@@ -175,14 +292,13 @@ export default function Home() {
         )}
       </AnimatePresence>
 
-      {/* Holographic Data HUD */}
+      {/* RIGHT SIDEBAR: Environmental Data */}
       <AnimatePresence>
         {data && !loading && (
           <motion.div
             initial={{ x: "100%", opacity: 0 }}
             animate={{ x: 0, opacity: 1 }}
             exit={{ x: "100%", opacity: 0 }}
-            transition={{ type: "spring", stiffness: 100, damping: 20 }}
             className="absolute top-0 right-0 h-full w-full md:w-[480px] bg-black/60 backdrop-blur-2xl border-l border-white/5 z-30 overflow-y-auto"
           >
             <div className="p-8 pb-32">
@@ -196,16 +312,14 @@ export default function Home() {
                   </h3>
                 </div>
                 <button 
-                  onClick={() => { setData(null); if(globeRef.current) globeRef.current.controls().autoRotate = true; }}
+                  onClick={() => setData(null)}
                   className="p-2 bg-white/5 hover:bg-red-500/20 text-white hover:text-red-400 rounded-full transition-colors mt-1"
                 >
                   <X className="w-5 h-5" />
                 </button>
               </div>
 
-              {/* Master Risk Metric Component */}
-              <div className="bg-gradient-to-br from-blue-900/30 to-slate-900/40 border border-blue-500/30 p-8 rounded-3xl relative overflow-hidden mb-10 shadow-[0_0_30px_rgba(59,130,246,0.1)]">
-                <div className="absolute -top-12 -right-12 w-48 h-48 bg-blue-500/20 rounded-full blur-3xl opacity-60 pointer-events-none" />
+              <div className="bg-gradient-to-br from-blue-900/30 to-slate-900/40 border border-blue-500/30 p-8 rounded-3xl relative overflow-hidden mb-10">
                 <span className="text-xs font-mono text-blue-300 uppercase tracking-widest block mb-6">Threat Level</span>
                 <div className="flex items-end gap-3">
                   <span className="text-[5rem] leading-none font-black text-white">{data.riskScore}</span>
@@ -219,60 +333,41 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* Advanced Particulate Breakdown */}
               <h4 className="text-xs font-mono text-slate-500 uppercase tracking-widest mb-4">Atmospheric Composition</h4>
               <div className="grid grid-cols-2 gap-4 mb-10">
-                <div className="bg-white/5 border border-white/5 p-5 rounded-2xl hover:bg-white/10 transition-colors">
-                  <div className="text-slate-400 text-xs tracking-wider mb-2 flex items-center justify-between">AQI (US) <Wind className="w-4 h-4 text-emerald-400" /></div>
+                <div className="bg-white/5 border border-white/5 p-5 rounded-2xl">
+                  <div className="text-slate-400 text-xs mb-2">AQI (US)</div>
                   <div className="text-3xl font-bold">{data.aqi}</div>
                 </div>
-                <div className="bg-white/5 border border-white/5 p-5 rounded-2xl hover:bg-white/10 transition-colors">
-                  <div className="text-slate-400 text-xs tracking-wider mb-2 flex items-center justify-between">PM 2.5 <Activity className="w-4 h-4 text-orange-400" /></div>
-                  <div className="text-3xl font-bold">{data.aqiDetails.pm25}<span className="text-[10px] ml-1 text-slate-500 font-normal">µg/³</span></div>
-                </div>
-                <div className="bg-white/5 border border-white/5 p-5 rounded-2xl hover:bg-white/10 transition-colors">
-                  <div className="text-slate-400 text-xs tracking-wider mb-2 flex items-center justify-between">PM 10 <Wind className="w-4 h-4 text-yellow-400" /></div>
-                  <div className="text-3xl font-bold">{data.aqiDetails.pm10}<span className="text-[10px] ml-1 text-slate-500 font-normal">µg/³</span></div>
-                </div>
-                <div className="bg-white/5 border border-white/5 p-5 rounded-2xl hover:bg-white/10 transition-colors">
-                  <div className="text-slate-400 text-xs tracking-wider mb-2 flex items-center justify-between">Ozone <Droplets className="w-4 h-4 text-blue-400" /></div>
-                  <div className="text-3xl font-bold">{data.aqiDetails.ozone}<span className="text-[10px] ml-1 text-slate-500 font-normal">µg/³</span></div>
+                <div className="bg-white/5 border border-white/5 p-5 rounded-2xl">
+                  <div className="text-slate-400 text-xs mb-2">PM 2.5</div>
+                  <div className="text-3xl font-bold">{data.aqiDetails.pm25}</div>
                 </div>
               </div>
 
-              {/* High-Resolution Pollutants */}
-              <h4 className="text-xs font-mono text-slate-500 uppercase tracking-widest mb-4">Pollen Count Detail</h4>
+              <h4 className="text-xs font-mono text-slate-500 uppercase tracking-widest mb-4">Pollen Count</h4>
               <div className="space-y-4 mb-10">
-                {data.details.map((item) => (
-                  <div key={item.name} className="flex justify-between items-center group bg-white/5 p-3 rounded-xl border border-white/5">
+                {data.details.map((item: any) => (
+                  <div key={item.name} className="flex justify-between items-center bg-white/5 p-3 rounded-xl">
                     <span className="text-sm text-slate-300 flex items-center gap-3">
-                       <Leaf className="w-4 h-4 text-slate-500 group-hover:text-emerald-400 transition-colors" />
+                       <Leaf className="w-4 h-4 text-emerald-400" />
                        {item.name}
                     </span>
-                    <span className="text-sm font-medium">{item.value.toFixed(1)} <span className="text-[10px] text-slate-500">µg</span></span>
+                    <span className="text-sm font-medium">{item.value.toFixed(1)} µg</span>
                   </div>
                 ))}
               </div>
 
-              {/* Live Trajectory Chart */}
               <h4 className="text-xs font-mono text-slate-500 uppercase tracking-widest mb-4">Trajectory (24H)</h4>
               <div className="h-48 w-full bg-slate-900/50 border border-white/5 rounded-2xl p-4">
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={chartData}>
-                    <defs>
-                      <linearGradient id="colorAQI" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.8} />
-                        <stop offset="95%" stopColor="#3b82f6" stopOpacity={0.0} />
-                      </linearGradient>
-                    </defs>
                     <XAxis dataKey="time" hide />
-                    <YAxis hide domain={['dataMin - 10', 'dataMax + 10']} />
+                    <YAxis hide />
                     <Tooltip 
-                      contentStyle={{ backgroundColor: "#0f172a", border: "1px solid #1e293b", borderRadius: "12px", fontSize: "12px", padding: "10px" }}
-                      itemStyle={{ color: "#60a5fa", fontWeight: "bold" }}
-                      labelStyle={{ color: "#94a3b8", marginBottom: "5px" }}
+                      contentStyle={{ backgroundColor: "#0f172a", border: "1px solid #1e293b", borderRadius: "12px", fontSize: "12px" }}
                     />
-                    <Area type="monotone" dataKey="AQI" stroke="#3b82f6" strokeWidth={3} fillOpacity={1} fill="url(#colorAQI)" />
+                    <Area type="monotone" dataKey="AQI" stroke="#3b82f6" fill="#3b82f630" />
                   </AreaChart>
                 </ResponsiveContainer>
               </div>
