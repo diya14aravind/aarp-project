@@ -12,7 +12,7 @@ import {
   LineChart, Line, CartesianGrid
 } from "recharts";
 import { predictAllergySeverity, PredictionResult } from "@/utils/prediction";
-import { io } from "socket.io-client";
+import io from "socket.io-client";
 import SensorCard from "@/components/SensorCard";
 
 const Globe = dynamic(() => import("react-globe.gl"), { ssr: false });
@@ -47,6 +47,10 @@ export default function Home() {
   const [bpmHistory, setBpmHistory] = useState<{ time: string; bpm: number }[]>([]);
   const [humidityHistory, setHumidityHistory] = useState<{ time: string; hum: number }[]>([]);
   const [prediction, setPrediction] = useState<PredictionResult | null>(null);
+  
+  // Emergency Protocol State
+  const [emergency, setEmergency] = useState<{ active: boolean, reason: string, timeLeft: number, dispatched: boolean } | null>(null);
+  const socketRef = useRef<any>(null);
 
   useEffect(() => {
     setDimensions({ width: window.innerWidth, height: window.innerHeight });
@@ -55,8 +59,23 @@ export default function Home() {
     return () => window.removeEventListener("resize", handleResize);
   }, []);
 
+  // Emergency Countdown Timer logic
   useEffect(() => {
-    const socket = io("http://localhost:3001");
+    let interval: any;
+    if (emergency?.active && !emergency.dispatched) {
+      interval = setInterval(() => {
+        setEmergency(prev => prev ? { ...prev, timeLeft: Math.max(0, prev.timeLeft - 1) } : null);
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [emergency?.active, emergency?.dispatched]);
+
+  useEffect(() => {
+    // FIX: Using dynamic mapping for Vercel vs Local
+    const bridgeUrl = process.env.NEXT_PUBLIC_BRIDGE_URL || "http://localhost:3001";
+    const socket = io(bridgeUrl);
+    socketRef.current = socket;
+
     socket.on("sensor-data", (newData: any) => {
       setSensorData(newData);
       const risk = predictAllergySeverity({
@@ -70,13 +89,26 @@ export default function Home() {
       const timeStamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
       setBpmHistory(prev => [...prev.slice(-30), { time: timeStamp, bpm: newData.bpm }]);
       setHumidityHistory(prev => [...prev.slice(-30), { time: timeStamp, hum: newData.hum }]);
-      
-      if (newData.lat !== 0 && newData.lng !== 0 && globeRef.current && !loading) {
-        // Option: Smoothly shift globe if user allows hardware tracking
-      }
     });
+
+    socket.on("emergency-start", (alert: any) => {
+       setEmergency({ active: true, reason: alert.reason, timeLeft: 120, dispatched: false });
+    });
+
+    socket.on("emergency-cancelled", () => {
+       setEmergency(null);
+    });
+
+    socket.on("emergency-dispatch", () => {
+       setEmergency(prev => prev ? { ...prev, dispatched: true } : null);
+    });
+
     return () => { socket.disconnect(); };
   }, [data, loading]);
+
+  const handleAcknowledge = () => {
+     if (socketRef.current) socketRef.current.emit("acknowledge");
+  };
 
   const fetchDataForCoordinates = async (lat: number, lon: number, name?: string) => {
     setLoading(true);
@@ -94,6 +126,17 @@ export default function Home() {
       setData(result);
     } catch (err: any) { setError(err.message); } 
     finally { setLoading(false); }
+  };
+
+  const useMyLocation = () => {
+    if ("geolocation" in navigator) {
+      navigator.geolocation.getCurrentPosition(
+        (position) => fetchDataForCoordinates(position.coords.latitude, position.coords.longitude),
+        () => setError("Location access denied.")
+      );
+    } else {
+      setError("Geolocation not supported.");
+    }
   };
 
   return (
@@ -157,14 +200,17 @@ export default function Home() {
                 {/* HEART RATE PULSE */}
                 <div className="p-6 rounded-3xl bg-black/40 border border-white/10 backdrop-blur-xl group relative overflow-hidden">
                   <div className="absolute top-0 right-0 p-4">
-                    <motion.div animate={{ scale: [1, 1.2, 1] }} transition={{ repeat: Infinity, duration: 60/sensorData.bpm }} >
-                      <Heart className="w-8 h-8 text-rose-500 fill-rose-500/20" />
+                    <motion.div 
+                      animate={{ scale: [1, 1.3, 1] }} 
+                      transition={{ repeat: Infinity, duration: 60/sensorData.bpm, ease: "easeInOut" }} 
+                    >
+                      <Heart className="w-10 h-10 text-rose-500 fill-rose-500/20 drop-shadow-[0_0_15px_rgba(244,63,94,0.5)]" />
                     </motion.div>
                   </div>
                   <p className="text-[10px] font-mono text-white/40 uppercase mb-1">Heart Rate</p>
                   <div className="flex items-baseline gap-2">
-                    <span className="text-6xl font-black text-white">{sensorData.bpm}</span>
-                    <span className="text-rose-400 font-bold text-lg">BPM</span>
+                    <span className="text-6xl font-black text-rose-400">{sensorData.bpm}</span>
+                    <span className="text-white/60 font-bold text-lg">BPM</span>
                   </div>
                   {/* SCANLINE PULSE WAVEFORM */}
                   <div className="mt-4 h-24 w-full bg-black/20 rounded-xl overflow-hidden border border-white/5">
@@ -313,6 +359,60 @@ export default function Home() {
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 z-[100] bg-black/80 backdrop-blur-md flex flex-col items-center justify-center">
             <div className="w-24 h-24 border-2 border-blue-500/20 border-t-blue-500 rounded-full animate-spin mb-6" />
             <span className="text-xs font-mono tracking-[0.5em] text-blue-400 animate-pulse uppercase">Syncing Atmospheric Uplink</span>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* FULL SCREEN EMERGENCY PROTOCOL OVERLAY */}
+      <AnimatePresence>
+        {emergency && (
+          <motion.div 
+            initial={{ opacity: 0 }} 
+            animate={{ opacity: 1 }} 
+            exit={{ opacity: 0 }} 
+            className="absolute inset-0 z-[200] bg-red-950/80 backdrop-blur-xl flex flex-col items-center justify-center"
+          >
+            <motion.div 
+               animate={{ opacity: [0.5, 1, 0.5] }} 
+               transition={{ repeat: Infinity, duration: 1 }}
+               className="absolute inset-0 border-[16px] border-red-600 pointer-events-none" 
+            />
+            
+            <ShieldAlert className="w-32 h-32 text-red-500 mb-8 animate-pulse" />
+            
+            <h1 className="text-6xl font-black text-white tracking-tighter uppercase text-center drop-shadow-lg">
+              CRITICAL EMERGENCY
+            </h1>
+            <p className="text-2xl text-red-300 font-mono mt-4 tracing-widest">
+              {'///'} {emergency.reason} {'///'}
+            </p>
+
+            <div className="mt-12 p-8 bg-black/50 border border-red-500/50 rounded-3xl flex flex-col items-center">
+               {!emergency.dispatched ? (
+                 <>
+                  <p className="text-sm font-mono text-white/50 uppercase mb-2">Automated Dispatch In</p>
+                  <p className="text-8xl font-black text-white mb-2">{emergency.timeLeft}s</p>
+                  <p className="text-xs text-red-400 font-mono text-center max-w-sm">
+                     If alarm is not acknowledged, Emergency Medical Services will be dispatched to coordinate GPS: {sensorData?.lat.toFixed(4)}, {sensorData?.lng.toFixed(4)}.
+                  </p>
+                 </>
+               ) : (
+                 <>
+                  <p className="text-sm font-mono text-white/50 uppercase mb-2">Notice</p>
+                  <p className="text-6xl font-black text-red-500 mb-2">DISPATCHED</p>
+                  <p className="text-xs text-red-400 font-mono text-center max-w-sm">
+                     Local authorities and hospital have been notified. Please remain calm.
+                  </p>
+                 </>
+               )}
+            </div>
+
+            <button 
+              onClick={handleAcknowledge}
+              className="mt-12 px-12 py-6 bg-white hover:bg-slate-200 text-red-900 font-black text-xl rounded-full tracking-wider transition-all active:scale-95 shadow-[0_0_40px_rgba(255,255,255,0.4)]"
+            >
+               ACKNOWLEDGE & CANCEL ALARM
+            </button>
           </motion.div>
         )}
       </AnimatePresence>
