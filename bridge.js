@@ -4,7 +4,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 
 const BAUD_RATE = 115200;
-const HTTP_PORT = 3001; 
+const HTTP_PORT = 3002; 
 const MOCK_MODE = process.argv.includes('--mock');
 
 const httpServer = http.createServer();
